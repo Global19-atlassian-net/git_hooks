@@ -1,0 +1,99 @@
+#!/usr/bin/env ruby
+
+###
+# To use:
+#   mkdir .git/hooks
+#   ln -s change_gemfile_branches_post_checkout_hook .git/hooks/post-checkout
+#
+# After linking, the script will be run each time `git checkout` is called
+# It will attempt to look for projects linked in the Gemfile that contain
+# the same branch as the active project.
+#
+# For example, given the following scenario:
+#   ontologies_linked_data, branches: master, staging, new_feature
+#      dependencies: goo, sparql-client
+#   goo, branches: master, staging, new_feature
+#   sparql-client, branches: master, staging
+#   From ontologies_linked_data:
+#     > git checkout new_feature
+#     == Checks for `new_feature` branch in goo. It exists, so the script
+#        switches the dependency in the ontologies_linked_data Gemfile to match
+#     == Checks for `new_feature` branch in sparql-client. If doesn't exist, so nothing happens
+
+# Exit cleanly from an early interrupt
+Signal.trap("INT") { exit 1 }
+
+$BRANCH_DEBUG = ENV["BRANCH_DEBUG"].eql?("true") || false
+require 'pp' if $BRANCH_DEBUG
+
+# Make sure the env is setup.
+# This shouldn't happen when switching branches as it should still be setup from the previous branch.
+`bundle check`
+if $?.exitstatus > 0
+  puts "Running bundle install to make environment match Gemfile"
+  `bundle install`
+end
+
+require 'bundler'
+BUNDLER = Bundler.load
+
+def git_gem?(g)
+  Dir.exist?(g.full_gem_path + "/.git")
+end
+
+def current_branch
+  @current_branch ||= `git rev-parse --abbrev-ref HEAD`.strip
+end
+
+def current_branches
+  @current_branches ||= `git branch --list`.split("\n").map {|b| b.strip.sub("* ", "")}
+end
+
+def path_branches(path)
+  branches = `cd #{path} && git fetch && git branch -a`.split("\n").map {|b| b.strip.sub("* ", "").split("/").last.split(" ").first}
+end
+
+def gem_branches(gem_name)
+  return @gem_branches[gem_name] || [] if defined?(@gem_branches)
+  gems = BUNDLER.specs
+  @gem_branches = {}
+  gems.each do |g|
+    next unless git_gem?(g)
+    @gem_branches[g.name] = path_branches(g.full_gem_path)
+  end
+  return @gem_branches[gem_name] || []
+end
+
+def gemfile_contents
+  @gemfile_contents ||= File.open("Gemfile", "r+").read
+end
+
+def gemfile_gems
+  @gemfile_gems ||= gemfile_contents.scan(/gem [\"\'](.*?)[\"\']/).map {|match| match[0]}
+end
+
+p "Current branch: #{current_branch}" if $BRANCH_DEBUG
+
+new_gemfile = gemfile_contents.gsub(/^(.*(branch:\s*|:branch\s*=\>\s*)[\"\'](.*)[\"\'].*$)/).each {|line|
+  branch = line.match(/(branch:\s*|:branch\s*=\>\s*)[\"\'](.*)[\"\']/)[2]
+  gem_name = line.match(/gem [\"\'](.*?)[\"\']/)[1]
+  if !current_branches.include?(branch)
+    line
+  elsif gem_branches(gem_name).include?(current_branch)
+    line.gsub(/(branch:\s*|:branch\s*=\>\s*)\"(.*)\"/, "branch: '#{current_branch}'")
+  else
+    line
+  end
+}
+
+gemfile = File.open("Gemfile", "w")
+gemfile.write(new_gemfile)
+gemfile.close
+puts new_gemfile if $BRANCH_DEBUG
+
+# Check to see if bundle is setup properly
+`bundle check`
+if $?.exitstatus > 0
+  puts "Running bundle install to switch to #{current_branch}"
+  `bundle install`
+end
